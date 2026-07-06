@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -86,6 +86,19 @@ DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
 EXCLUDED_CLASSES = {"Progman", "Shell_TrayWnd", "Windows.UI.Core.CoreWindow",
                     "WorkerW", "Shell_SecondaryTrayWnd"}
 
+# Windows whose content is a remote session: they ignore posted window
+# messages (input is captured as real events and forwarded), so they need
+# Real-cursor mode.
+REMOTE_CLIENT_PATTERNS = ("horizon", "omnissa", "vmware", "citrix",
+                          "remote desktop", "remotedesktop", "mstsc", "rdp",
+                          "anydesk", "teamviewer", "parsec", "rustdesk")
+REMOTE_CLIENT_CLASSES = ("tscshellcontainerclass", "vmwareclient")
+
+DWM_TNP_RECTDESTINATION = 0x0001
+DWM_TNP_OPACITY = 0x0004
+DWM_TNP_VISIBLE = 0x0008
+DWM_TNP_SOURCECLIENTAREAONLY = 0x0010
+
 if ctypes.sizeof(ctypes.c_void_p) == 8:
     ULONG_PTR = ctypes.c_ulonglong
 else:
@@ -121,6 +134,19 @@ class RECT(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+class SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
+    _fields_ = [("dwFlags", ctypes.c_uint),
+                ("rcDestination", RECT),
+                ("rcSource", RECT),
+                ("opacity", ctypes.c_ubyte),
+                ("fVisible", ctypes.c_int),
+                ("fSourceClientAreaOnly", ctypes.c_int)]
+
+
 if IS_WINDOWS:
     user32 = ctypes.windll.user32
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
@@ -132,6 +158,19 @@ if IS_WINDOWS:
                                        ctypes.POINTER(POINT), ctypes.c_uint]
     user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     user32.GetAncestor.restype = ctypes.c_void_p
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.WindowFromPoint.argtypes = [POINT]
+    user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    dwmapi = ctypes.windll.dwmapi
+    dwmapi.DwmRegisterThumbnail.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.POINTER(ctypes.c_void_p)]
+    dwmapi.DwmUnregisterThumbnail.argtypes = [ctypes.c_void_p]
+    dwmapi.DwmUpdateThumbnailProperties.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(DWM_THUMBNAIL_PROPERTIES)]
+    dwmapi.DwmQueryThumbnailSourceSize.argtypes = [ctypes.c_void_p,
+                                                   ctypes.POINTER(SIZE)]
 
 
 def set_dpi_aware():
@@ -238,6 +277,70 @@ def bring_to_front(hwnd):
     user32.SetForegroundWindow(hwnd)
 
 
+def force_foreground(hwnd):
+    """SetForegroundWindow with the AttachThreadInput fallback for when
+    Windows refuses to let a background process steal focus."""
+    if user32.GetForegroundWindow() == hwnd:
+        return
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    if user32.SetForegroundWindow(hwnd):
+        return
+    fg = user32.GetForegroundWindow()
+    cur = ctypes.windll.kernel32.GetCurrentThreadId()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    if fg_thread and fg_thread != cur:
+        user32.AttachThreadInput(fg_thread, cur, True)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.AttachThreadInput(fg_thread, cur, False)
+
+
+def looks_like_remote_client(hwnd, title):
+    """Remote-desktop client windows need Real-cursor mode."""
+    haystack = (title + " " + _get_class_name(hwnd)).lower()
+    return (any(p in haystack for p in REMOTE_CLIENT_PATTERNS)
+            or any(c in haystack for c in REMOTE_CLIENT_CLASSES))
+
+
+def cursor_click_window(hwnd, fx, fy):
+    """Real-input click at a window fraction, as unobtrusive as possible.
+
+    Remote-desktop clients (RDP, Omnissa Horizon, Citrix...) only forward
+    real input, so this sends a genuine click. The window is raised only if
+    something else covers the click point, the cursor is restored right
+    after, and the window you were working in gets focus back.
+    """
+    geom = get_client_geometry(hwnd)
+    if geom is None:
+        return False
+    sx, sy, w, h = geom
+    px = sx + round(fx * max(w - 1, 1))
+    py = sy + round(fy * max(h - 1, 1))
+
+    root_target = user32.GetAncestor(hwnd, GA_ROOT)
+    hit = user32.WindowFromPoint(POINT(px, py))
+    covered = not hit or user32.GetAncestor(hit, GA_ROOT) != root_target
+
+    prev = user32.GetForegroundWindow()
+    if covered:
+        force_foreground(hwnd)
+        time.sleep(0.15)
+        geom = get_client_geometry(hwnd)
+        if geom is None:
+            return False
+        sx, sy, w, h = geom
+        px = sx + round(fx * max(w - 1, 1))
+        py = sy + round(fy * max(h - 1, 1))
+
+    cursor_click_at(px, py)
+
+    if covered and prev and prev != root_target and user32.IsWindow(prev):
+        time.sleep(0.08)
+        force_foreground(prev)
+    return True
+
+
 def post_click(hwnd, fx, fy, client_size):
     """Deliver a click at a client-area fraction using window messages only.
 
@@ -287,6 +390,12 @@ def cursor_click_at(sx, sy):
     _send_mouse(move | MOUSEEVENTF_LEFTUP, nx, ny)
     time.sleep(0.03)
     user32.SetCursorPos(old[0], old[1])
+
+
+def resource_path(rel):
+    """Path to a bundled resource, both in dev and in the PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +462,205 @@ def truncate(text, limit):
 
 
 # ---------------------------------------------------------------------------
+# Graphical window picker (live previews via the DWM thumbnail API — the
+# same mechanism as the Windows taskbar previews)
+# ---------------------------------------------------------------------------
+
+class WindowPicker:
+    COLS, ROWS = 3, 2
+    TILE_W, TILE_H = 272, 196
+    THUMB_W, THUMB_H = 256, 140
+    GAP, MARGIN, HEADER, FOOTER = 12, 14, 48, 56
+
+    def __init__(self, parent, exclude_hwnds, on_select):
+        self.on_select = on_select
+        self.windows = []
+        self.page = 0
+        self.thumbs = []
+        self.hover = None
+
+        self.W = self.MARGIN * 2 + self.COLS * self.TILE_W + (self.COLS - 1) * self.GAP
+        self.H = (self.HEADER + self.FOOTER + self.MARGIN
+                  + self.ROWS * self.TILE_H + (self.ROWS - 1) * self.GAP)
+
+        top = tk.Toplevel(parent)
+        self.top = top
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.configure(bg=COL_ACCENT)
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        top.geometry(f"{self.W}x{self.H}+{max((sw - self.W) // 2, 0)}"
+                     f"+{max((sh - self.H) // 3, 0)}")
+
+        self.canvas = tk.Canvas(top, width=self.W - 2, height=self.H - 2,
+                                bg=COL_BG, highlightthickness=0)
+        self.canvas.pack(padx=1, pady=1)
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Button-1>", self._on_click)
+        top.bind("<Escape>", lambda e: self._close())
+        top.protocol("WM_DELETE_WINDOW", self._close)
+
+        self.prev_btn = pill_button(self.canvas, "‹", COL_CARD_HI, COL_BORDER,
+                                    lambda: self._flip(-1), fg=COL_TEXT, padx=14)
+        self.next_btn = pill_button(self.canvas, "›", COL_CARD_HI, COL_BORDER,
+                                    lambda: self._flip(1), fg=COL_TEXT, padx=14)
+        self.refresh_btn = pill_button(self.canvas, "↻ Refresh", COL_CARD_HI,
+                                       COL_BORDER, self.refresh, fg=COL_TEXT)
+        self.cancel_btn = pill_button(self.canvas, "✕ Cancel", COL_RED,
+                                      COL_RED_HOVER, self._close)
+
+        top.update_idletasks()
+        self.dest_hwnd = user32.GetAncestor(top.winfo_id(), GA_ROOT)
+        self.exclude = set(exclude_hwnds) | {self.dest_hwnd}
+
+        top.grab_set()
+        top.focus_force()
+        self.refresh()
+
+    # ---- data ----
+
+    def refresh(self):
+        self.windows = list_windows(self.exclude)
+        self.page = 0
+        self._render()
+
+    def _pages(self):
+        per = self.COLS * self.ROWS
+        return max((len(self.windows) + per - 1) // per, 1)
+
+    def _flip(self, step):
+        new = min(max(self.page + step, 0), self._pages() - 1)
+        if new != self.page:
+            self.page = new
+            self._render()
+
+    # ---- rendering ----
+
+    def _tile_rect(self, i):
+        col, row = i % self.COLS, i // self.COLS
+        x = self.MARGIN + col * (self.TILE_W + self.GAP)
+        y = self.HEADER + row * (self.TILE_H + self.GAP)
+        return x, y
+
+    def _render(self):
+        self._unregister_all()
+        c = self.canvas
+        c.delete("all")
+        self.hover = None
+
+        c.create_text(self.MARGIN, 16, anchor="w", fill=COL_TEXT,
+                      text="Choose the window to keep alive",
+                      font=(FONT, 13, "bold"))
+        c.create_text(self.MARGIN, 34, anchor="w", fill=COL_SUB,
+                      text="Live previews — click one to select it  •  Esc to cancel",
+                      font=(FONT, 9))
+
+        per = self.COLS * self.ROWS
+        page_windows = self.windows[self.page * per:(self.page + 1) * per]
+
+        if not page_windows:
+            c.create_text(self.W // 2, self.H // 2, fill=COL_SUB,
+                          text="No windows found — press Refresh",
+                          font=(FONT, 11))
+        for i, (hwnd, title) in enumerate(page_windows):
+            x, y = self._tile_rect(i)
+            c.create_rectangle(x, y, x + self.TILE_W, y + self.TILE_H,
+                               fill=COL_CARD, outline=COL_BORDER,
+                               tags=f"tile{i}")
+            c.create_text(x + self.TILE_W // 2, y + self.THUMB_H + 8 + 22,
+                          text=truncate(title, 38), fill=COL_TEXT,
+                          font=(FONT, 9, "bold"), width=self.TILE_W - 16)
+            if not self._register_thumb(hwnd, x + 8, y + 8):
+                c.create_text(x + self.TILE_W // 2, y + 8 + self.THUMB_H // 2,
+                              text="🪟", fill=COL_SUB, font=(FONT, 28))
+
+        fy = self.H - self.FOOTER + 12
+        c.create_window(self.MARGIN, fy, anchor="nw", window=self.refresh_btn)
+        c.create_window(self.W // 2 - 40, fy, anchor="ne", window=self.prev_btn)
+        c.create_text(self.W // 2, fy + 15, fill=COL_SUB,
+                      text=f"{self.page + 1} / {self._pages()}", font=(FONT, 10))
+        c.create_window(self.W // 2 + 40, fy, anchor="nw", window=self.next_btn)
+        c.create_window(self.W - self.MARGIN, fy, anchor="ne", window=self.cancel_btn)
+
+    def _register_thumb(self, hwnd, dx, dy):
+        try:
+            thumb = ctypes.c_void_p()
+            if dwmapi.DwmRegisterThumbnail(self.dest_hwnd, hwnd,
+                                           ctypes.byref(thumb)) != 0 or not thumb.value:
+                return False
+            src = SIZE()
+            dwmapi.DwmQueryThumbnailSourceSize(thumb, ctypes.byref(src))
+            sw, sh = max(src.cx, 1), max(src.cy, 1)
+            scale = min(self.THUMB_W / sw, self.THUMB_H / sh, 1.0)
+            tw, th = max(int(sw * scale), 1), max(int(sh * scale), 1)
+            ox = dx + (self.THUMB_W - tw) // 2 + 1   # +1: canvas offset in window
+            oy = dy + (self.THUMB_H - th) // 2 + 1
+            props = DWM_THUMBNAIL_PROPERTIES()
+            props.dwFlags = (DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE
+                             | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY)
+            props.rcDestination = RECT(ox, oy, ox + tw, oy + th)
+            props.opacity = 255
+            props.fVisible = 1
+            props.fSourceClientAreaOnly = 1
+            dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props))
+            self.thumbs.append(thumb)
+            return True
+        except Exception:
+            return False
+
+    def _unregister_all(self):
+        for thumb in self.thumbs:
+            try:
+                dwmapi.DwmUnregisterThumbnail(thumb)
+            except Exception:
+                pass
+        self.thumbs = []
+
+    # ---- interaction ----
+
+    def _tile_at(self, x, y):
+        per = self.COLS * self.ROWS
+        count = len(self.windows[self.page * per:(self.page + 1) * per])
+        for i in range(count):
+            tx, ty = self._tile_rect(i)
+            if tx <= x <= tx + self.TILE_W and ty <= y <= ty + self.TILE_H:
+                return i
+        return None
+
+    def _on_motion(self, event):
+        i = self._tile_at(event.x, event.y)
+        if i == self.hover:
+            return
+        self.hover = i
+        self.canvas.delete("hoverbox")
+        if i is not None:
+            x, y = self._tile_rect(i)
+            self.canvas.create_rectangle(x - 2, y - 2, x + self.TILE_W + 2,
+                                         y + self.TILE_H + 2,
+                                         outline=COL_ACCENT, width=2,
+                                         tags="hoverbox")
+
+    def _on_click(self, event):
+        i = self._tile_at(event.x, event.y)
+        if i is None:
+            return
+        per = self.COLS * self.ROWS
+        idx = self.page * per + i
+        if idx < len(self.windows):
+            hwnd, title = self.windows[idx]
+            self._close()
+            self.on_select(hwnd, title)
+
+    def _close(self):
+        self._unregister_all()
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        self.top.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
@@ -374,14 +682,15 @@ class AutoClickerApp:
 
         self.bar = None
         self.overlay = None
+        self.picker = None
         self._tick_job = None
         self._drag_offset = None
         self._pulse_on = False
 
         self._build_styles()
         self._build_setup_window()
-        self._refresh_windows()
         self._restore_saved_config()
+        self._update_window_readout()
         self._draw_preview()
 
     # ---------------- Styling ----------------
@@ -460,15 +769,15 @@ class AutoClickerApp:
 
         # Step 1: target window
         body1 = self._card(outer, 1, "Target window",
-                           "Clicks are sent straight to this window in the background —\n"
-                           "your mouse stays free for everything else.")
-        self.window_combo = ttk.Combobox(body1, state="readonly",
-                                         style="Dark.TCombobox", font=(FONT, 10))
-        self.window_combo.pack(side="left", fill="x", expand=True)
-        self.window_combo.bind("<<ComboboxSelected>>", self._on_window_selected)
-        refresh = pill_button(body1, "↻", COL_CARD_HI, COL_BORDER,
-                              self._refresh_windows, fg=COL_TEXT, padx=12, pady=4)
-        refresh.pack(side="left", padx=(8, 0))
+                           "Pick the window from live previews. Clicks go to this\n"
+                           "window only — your mouse stays free for everything else.")
+        self.window_label = tk.Label(body1, text="No window selected",
+                                     bg=COL_CARD, fg=COL_SUB, anchor="w",
+                                     justify="left", wraplength=230,
+                                     font=(FONT, 10, "bold"))
+        self.window_label.pack(side="left", fill="x", expand=True)
+        pill_button(body1, "🪟  Choose…", COL_ACCENT, COL_ACCENT_HOVER,
+                    self._choose_window).pack(side="left", padx=(8, 0))
 
         # Step 2: click point
         body2 = self._card(outer, 2, "Click point",
@@ -510,7 +819,7 @@ class AutoClickerApp:
         method_row.pack(fill="x", pady=(2, 10))
         self.method_var = tk.StringVar(value="background")
         for value, label in (("background", "🫥 Background (invisible, mouse stays free)"),
-                             ("cursor", "🖱 Real cursor (moves the mouse)")):
+                             ("cursor", "🖱 Real cursor (for RDP / Horizon / Citrix windows)")):
             tk.Radiobutton(method_row, text=label, value=value,
                            variable=self.method_var, bg=COL_BG, fg=COL_SUB,
                            selectcolor=COL_CARD_HI, activebackground=COL_BG,
@@ -543,32 +852,36 @@ class AutoClickerApp:
                     pass
         return hwnds
 
-    def _refresh_windows(self):
-        self.windows = list_windows(self._own_hwnds())
-        self.window_combo["values"] = [truncate(t, 70) for _, t in self.windows]
-        # keep / re-find current target after refresh
-        for i, (hwnd, title) in enumerate(self.windows):
-            if hwnd == self.target_hwnd or (
-                    self.target_hwnd is None and title == self.target_title):
-                self.window_combo.current(i)
-                self.target_hwnd, self.target_title = hwnd, title
-                break
+    def _choose_window(self):
+        if self.picker is not None and self.picker.top.winfo_exists():
+            return
+        self.picker = WindowPicker(self.root, self._own_hwnds(), self._set_target)
+
+    def _set_target(self, hwnd, title):
+        self.picker = None
+        self.target_hwnd, self.target_title = hwnd, title
+        self.cached_client_size = None
+        geom = get_client_geometry(hwnd)
+        if geom:
+            self.cached_client_size = (geom[2], geom[3])
+        if looks_like_remote_client(hwnd, title) and self.method_var.get() == "background":
+            self.method_var.set("cursor")
+            self._hint("Remote-desktop window detected — switched to Real cursor "
+                       "mode (remote sessions ignore background clicks).")
         else:
-            self.window_combo.set("")
-            self.target_hwnd = None
+            self._hint("Window selected. Now pick the click point.")
+        save_config(self._current_config())
+        self._update_window_readout()
         self._draw_preview()
 
-    def _on_window_selected(self, _event=None):
-        i = self.window_combo.current()
-        if 0 <= i < len(self.windows):
-            self.target_hwnd, self.target_title = self.windows[i]
-            self.cached_client_size = None
-            geom = get_client_geometry(self.target_hwnd)
-            if geom:
-                self.cached_client_size = (geom[2], geom[3])
-            save_config(self._current_config())
-            self._draw_preview()
-            self._hint("Window selected. Now pick the click point.")
+    def _update_window_readout(self):
+        if self.target_title:
+            alive = self.target_hwnd is not None and user32.IsWindow(self.target_hwnd)
+            self.window_label.config(
+                text=("✔ " if alive else "⚠ (closed) ") + truncate(self.target_title, 60),
+                fg=COL_TEXT if alive else COL_AMBER)
+        else:
+            self.window_label.config(text="No window selected", fg=COL_SUB)
 
     def _target_geometry(self):
         """Client geometry of the target, refreshing the size cache."""
@@ -597,7 +910,7 @@ class AutoClickerApp:
         CW, CH = 272, 140
 
         if self.target_hwnd is None and self.target_title is None:
-            c.create_text(CW // 2, CH // 2, text="Select a window above",
+            c.create_text(CW // 2, CH // 2, text="Choose a window above",
                           fill=COL_SUB, font=(FONT, 10))
             return
 
@@ -773,13 +1086,11 @@ class AutoClickerApp:
             if not self._reattach_window():
                 return "lost"
         if self.method_var.get() == "cursor":
-            geom = self._target_geometry()
+            geom = self._target_geometry()   # refresh the size cache
             if geom is None:
                 return "lost"
-            sx, sy, w, h = geom
-            fx, fy = self.fraction
-            cursor_click_at(sx + round(fx * (w - 1)), sy + round(fy * (h - 1)))
-            return "ok"
+            ok = cursor_click_window(self.target_hwnd, *self.fraction)
+            return "ok" if ok else "lost"
         # background mode: prefer live size, fall back to cache when minimized
         geom = self._target_geometry()
         size = (geom[2], geom[3]) if geom else self.cached_client_size
@@ -800,6 +1111,22 @@ class AutoClickerApp:
                     "blocked": "Click was blocked — the target may need AutoClicker "
                                "to run as administrator.",
                     "lost": "Target window not found — reselect it in step 1."}[state])
+        if state == "ok" and self.method_var.get() == "background":
+            self.root.after(700, self._confirm_background_test)
+
+    def _confirm_background_test(self):
+        registered = messagebox.askyesno(
+            APP_NAME,
+            "Did the target app actually register the test click?\n\n"
+            "Remote-desktop windows (RDP, Omnissa Horizon, Citrix...) ignore "
+            "background clicks — they only forward real input.\n\n"
+            "Choose No to switch to Real cursor mode and try again.")
+        if registered:
+            self._hint("Great — background mode works for this window.")
+        else:
+            self.method_var.set("cursor")
+            save_config(self._current_config())
+            self._hint("Switched to Real cursor mode — press Test click again.")
 
     # ---------------- Start / validation ----------------
 
@@ -825,7 +1152,10 @@ class AutoClickerApp:
         title = cfg.get("window_title")
         if title and self.target_hwnd is None:
             self.target_title = title
-            self._refresh_windows()   # auto-reselect if that window is open
+            if self._reattach_window():   # auto-reselect if that window is open
+                geom = get_client_geometry(self.target_hwnd)
+                if geom:
+                    self.cached_client_size = (geom[2], geom[3])
 
     def _read_interval(self):
         try:
@@ -1004,6 +1334,7 @@ class AutoClickerApp:
             self.bar = None
         self.root.deiconify()
         self.root.lift()
+        self._update_window_readout()
         self._draw_preview()
         self._hint(f"Stopped after {self.click_count} clicks.")
 
@@ -1022,6 +1353,12 @@ def main():
         messagebox.showerror(APP_NAME, "This application only runs on Windows.")
         root.destroy()
         return
+    try:
+        icon = tk.PhotoImage(file=resource_path(os.path.join("assets", "icon.png")))
+        root.iconphoto(True, icon)
+        root._icon_image = icon   # keep a reference so tk doesn't drop it
+    except Exception:
+        pass
     AutoClickerApp(root)
     root.mainloop()
 

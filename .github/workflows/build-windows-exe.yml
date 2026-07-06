@@ -23,8 +23,8 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
-      - name: Build AutoClicker.exe
-        run: pyinstaller --onefile --noconsole --name AutoClicker autoclicker.py
+      - name: Generate icon and version resource
+        run: python build_assets.py
 
       - name: Read app version
         id: ver
@@ -33,11 +33,30 @@ jobs:
           version=$(python -c "import re; print(re.search(r'APP_VERSION = \"(.+?)\"', open('autoclicker.py', encoding='utf-8').read()).group(1))")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Build AutoClicker.exe (single file)
+        run: >
+          pyinstaller --onefile --noconsole --noupx --name AutoClicker
+          --icon assets/icon.ico --version-file version_info.txt
+          --add-data "assets/icon.png;assets" autoclicker.py
+
+      - name: Build portable folder variant
+        run: >
+          pyinstaller -y --noconsole --noupx --name AutoClicker
+          --icon assets/icon.ico --version-file version_info.txt
+          --add-data "assets/icon.png;assets" --distpath dist-portable
+          autoclicker.py
+
+      - name: Zip portable variant
+        shell: pwsh
+        run: Compress-Archive -Path dist-portable/AutoClicker -DestinationPath "AutoClicker-v${{ steps.ver.outputs.version }}-portable.zip"
+
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: AutoClicker-windows-exe
-          path: dist/AutoClicker.exe
+          path: |
+            dist/AutoClicker.exe
+            AutoClicker-v*-portable.zip
           if-no-files-found: error
 
       - name: Publish release
@@ -46,13 +65,19 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: AutoClicker v${{ steps.ver.outputs.version }}
-          files: dist/AutoClicker.exe
+          files: |
+            dist/AutoClicker.exe
+            AutoClicker-v*-portable.zip
           make_latest: true
           body: |
             **Download `AutoClicker.exe` below** — no installation needed, just run it.
 
-            Windows may show a SmartScreen warning the first time because the exe is unsigned:
-            choose *More info → Run anyway*.
+            If Windows SmartScreen or your antivirus flags the download (common for
+            unsigned open-source exes), either:
+            - click **More info → Run anyway** on the SmartScreen prompt, or
+            - right-click the file → **Properties → Unblock → OK**, or
+            - use the **portable .zip** instead — extract it and run
+              `AutoClicker/AutoClicker.exe` (zip downloads are flagged less often).
 
             See the [README](https://github.com/${{ github.repository }}#readme) for usage
             instructions and the changelog.

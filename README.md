@@ -2,21 +2,33 @@
 
 A small Windows app that keeps another application alive by clicking a spot **inside a window of your choice** at a fixed interval — silently, in the background, without ever touching your mouse.
 
-Built for remote setups: run it on a VM and connect from a phone, iPad or PC at any resolution — the click keeps landing on the right spot.
+Built for remote setups: run it on a VM and connect from a phone, iPad or PC at any resolution — the click keeps landing on the right spot. Works with remote-desktop client windows too (RDP, **Omnissa Horizon**, Citrix), including nested sessions (a Horizon window inside an RDP session).
 
 ## 📥 Download
 
-**➡ [Download the latest `AutoClicker.exe` from Releases](https://github.com/albusthaw/AutoClick/releases/latest)**
-(direct link: [`AutoClicker.exe`](https://github.com/albusthaw/AutoClick/releases/latest/download/AutoClicker.exe))
+**➡ [Download the latest release](https://github.com/albusthaw/AutoClick/releases/latest)**
 
-No installation — it's a single portable exe. Windows SmartScreen may warn on first launch because the exe is unsigned: choose **More info → Run anyway**.
+| File | What it is |
+|---|---|
+| [`AutoClicker.exe`](https://github.com/albusthaw/AutoClick/releases/latest/download/AutoClicker.exe) | Single portable exe — just run it |
+| `AutoClicker-v*-portable.zip` | Same app as a folder — extract and run `AutoClicker\AutoClicker.exe`. Use this if your browser or antivirus blocks the bare exe |
 
-Every push to the default branch automatically builds the exe and publishes it to [Releases](https://github.com/albusthaw/AutoClick/releases). Development builds for other branches are available as artifacts on the [Actions](https://github.com/albusthaw/AutoClick/actions) tab.
+### ⚠ "Windows protected your PC" / antivirus warnings
+
+This is an unsigned open-source tool (code-signing certificates cost hundreds of dollars a year), so Windows treats it as an unknown publisher. The exe embeds proper version/publisher metadata and an icon to help reputation, but you may still see a warning the first time:
+
+- **SmartScreen prompt** → click *More info* → *Run anyway*
+- **Browser flags the download** → keep it (Chrome/Edge: Downloads → ⋯ → *Keep*), or download the **portable .zip** instead — archives are flagged far less often
+- **File won't run after download** → right-click → *Properties* → check *Unblock* → OK
+- **Defender quarantines it** → Windows Security → *Protection history* → *Allow on device*, or add an exclusion for the folder
+
+You can always audit the code (it's one Python file) and build the exe yourself with `build.bat`.
 
 ## ✨ Features
 
-- 🪟 **Window-targeted** — pick the target window from a list; clicks are delivered to *that window only*
-- 🫥 **True background clicking** — clicks are sent as window messages (`PostMessage`), so the mouse cursor never moves and you can keep working in other apps while it runs
+- 🪟 **Graphical window picker** — choose the target from a grid of **live window previews** (like the Windows taskbar previews), not a text list
+- 🫥 **True background clicking** — clicks are sent as window messages, so the mouse cursor never moves and you can keep working in other apps while it runs
+- 🖱 **Real-cursor mode for remote-desktop windows** — RDP / Omnissa Horizon / Citrix windows only forward *real* input; this mode clicks physically, then instantly restores your cursor and gives focus back to the window you were using. Remote-client windows are detected automatically and the right mode is pre-selected
 - 📐 **Resolution-independent** — the click point is stored as a *percentage of the window*, recalculated at every click, so it adapts when the screen resolution or window size changes (RDP from phone/iPad/PC)
 - 🎯 **Graphical point picking** — a translucent overlay appears over the target window; click the exact spot, watch the animated crosshair confirm it, and see it marked on a live mini-preview
 - ⏱ **Flexible frequency** — every *N* seconds, minutes or hours
@@ -28,10 +40,11 @@ Every push to the default branch automatically builds the exe and publishes it t
 ## 🚀 How to use
 
 1. Run `AutoClicker.exe`.
-2. **Step 1 — Target window**: pick the app's window from the dropdown (press `↻` to refresh the list).
-3. **Step 2 — Click point**: press **🎯 Pick point**. The target window comes to the front with a translucent blue overlay — click the exact spot you want auto-clicked. An animated crosshair flashes where you picked, and the point appears on the mini-preview. Use **👁 Show** to flash the marker again, and **🖱 Test click** to verify the click actually works.
-4. **Step 3 — Frequency**: e.g. every `30 seconds`, `5 minutes` or `1 hours`.
-5. Press **▶ Start clicking**. The window collapses into a slim always-on-top bar:
+2. **Step 1 — Target window**: press **🪟 Choose…** and click the window in the live-preview grid.
+3. **Step 2 — Click point**: press **🎯 Pick point**. The target window comes to the front with a translucent blue overlay — click the exact spot you want auto-clicked. An animated crosshair flashes where you picked, and the point appears on the mini-preview.
+4. **Test it**: press **🖱 Test click**. In background mode the app then asks whether the click actually registered — if it didn't (typical for remote-desktop windows), it switches to Real cursor mode automatically so you can test again.
+5. **Step 3 — Frequency**: e.g. every `30 seconds`, `5 minutes` or `1 hours`.
+6. Press **▶ Start clicking**. The window collapses into a slim always-on-top bar:
    - **⏸ Pause / ▶ Resume** — temporarily stop clicking
    - **↻ Restart** — reset the timer and click counter
    - **⏹ Stop** — return to the setup screen
@@ -41,9 +54,16 @@ Every push to the default branch automatically builds the exe and publishes it t
 
 **Resolution independence.** The click point is saved as a fraction of the target window's *client area* (e.g. "37% across, 62% down"), never as a pixel. Each click re-reads the window's current size and position, so the same relative spot gets clicked at any resolution, window size, or DPI — exactly what you need when a VM's resolution changes between phone, iPad and desktop RDP sessions.
 
-**Background clicking.** In the default *Background* mode, clicks are posted directly to the target window (down to the exact child control under the point) as `WM_LBUTTONDOWN`/`WM_LBUTTONUP` messages. The physical cursor never moves, the target window doesn't need to be in front, and your own mouse/keyboard activity is untouched.
+**Background mode.** Clicks are posted directly to the target window (down to the exact child control under the point) as `WM_LBUTTONDOWN`/`WM_LBUTTONUP` messages. The physical cursor never moves, the target window doesn't need to be in front, and your own mouse/keyboard activity is untouched. Works for most normal applications.
 
-**Fallback mode.** A few apps ignore synthetic window messages (games with raw input, some elevated apps). For those, switch to *Real cursor* mode: it performs a physical click at the point and instantly restores your cursor to where it was. This mode briefly moves the mouse and clicks whatever is on top at that spot, so prefer Background mode when it works — verify with **Test click**.
+**Real cursor mode — for remote-desktop windows.** Clients like RDP (`mstsc`), Omnissa/VMware Horizon and Citrix don't act on posted messages: they capture *real* input events and forward them into the remote session. For these windows AutoClicker performs a genuine click, engineered to interfere as little as possible:
+
+1. If something covers the click point, the target window is raised first (otherwise it isn't touched).
+2. The click is sent with hardware-level input at the exact spot — this is what gets forwarded into the remote session (even nested ones, e.g. Horizon inside RDP).
+3. Your cursor is restored to where it was within ~50 ms.
+4. If a different window had focus before, focus is handed back to it.
+
+AutoClicker detects remote-client windows by name/class and pre-selects this mode for them; the **Test click** confirmation flow catches any app it doesn't know about.
 
 ### Limitations
 
@@ -51,7 +71,8 @@ Every push to the default branch automatically builds the exe and publishes it t
 |---|---|
 | Target window closed | Bar shows "window not found"; re-attaches automatically when a window with the same title reappears |
 | Target app runs as administrator | Windows blocks messages from normal apps (bar shows "blocked") — run AutoClicker as administrator too |
-| Games using raw input / DirectInput | Background mode may be ignored — use *Real cursor* mode |
+| Remote-desktop / games with raw input | Background mode is ignored — use *Real cursor* mode (auto-detected for known clients) |
+| Real-cursor mode while you're typing/clicking | The cursor teleports to the target for ~50 ms per click, then returns; focus is restored. Brief, but not invisible |
 | Window minimized | Background clicks use the last known window size; some apps ignore clicks while minimized — keep the window restored (it can be behind other windows) |
 | Locked / signed-out session | Windows delivers no input to a locked desktop — keep the VM session signed in |
 
@@ -61,14 +82,22 @@ Every push to the default branch automatically builds the exe and publishes it t
 build.bat
 ```
 
-Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows; the app itself is pure standard library (tkinter + ctypes), and only PyInstaller is needed for packaging. You can also run it directly with `python autoclicker.py`.
+Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows; the app itself is pure standard library (tkinter + ctypes), and only PyInstaller is needed for packaging. The icon and Windows version resource are generated by `build_assets.py` (also pure stdlib). You can also run the app directly with `python autoclicker.py`.
 
 ## 📦 Releases & versioning
 
-- Every push to the default branch builds `AutoClicker.exe` and publishes it under a `v<version>` tag in [Releases](https://github.com/albusthaw/AutoClick/releases) (version comes from `APP_VERSION` in `autoclicker.py`).
+- Every push to the default branch builds the exe + portable zip and publishes them under a `v<version>` tag in [Releases](https://github.com/albusthaw/AutoClick/releases) (version comes from `APP_VERSION` in `autoclicker.py`).
 - This README is updated with each release — changelog below.
 
 ## 📝 Changelog
+
+### v2.1.0
+- **Remote-desktop support**: Real-cursor mode reworked for RDP / Omnissa Horizon / Citrix windows (incl. nested sessions like Horizon inside RDP) — raises the window only when covered, clicks with hardware input, restores cursor and gives focus back to what you were doing
+- **Auto-detection** of remote-client windows — the right click mode is pre-selected
+- **Test click verification**: after a background-mode test, the app asks whether the click registered and switches modes automatically if not
+- **Graphical window picker**: choose the target from a grid of live window previews instead of a text dropdown
+- App icon + embedded Windows version/publisher metadata (improves SmartScreen/antivirus reputation), and a **portable .zip** release variant for downloads that browsers block
+- README: added unblock/quarantine guidance
 
 ### v2.0.0
 - **Window-targeted clicking**: choose a target window; clicks go inside that window only

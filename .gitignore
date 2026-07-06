@@ -2,4 +2,8 @@ __pycache__/
 *.pyc
 build/
 dist/
+dist-portable/
+assets/
+version_info.txt
 *.spec
+*.zip
