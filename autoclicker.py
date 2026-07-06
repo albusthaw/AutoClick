@@ -13,17 +13,27 @@ at a fixed interval.
   working in other apps while it clicks in the background.
 """
 
+import base64
 import ctypes
 import json
 import os
+import queue
 import random
 import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+try:
+    import numpy as np
+    import visionmatch as vm
+    HAS_VISION = True
+except Exception:
+    HAS_VISION = False
+
 APP_NAME = "AutoClicker"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -35,6 +45,10 @@ MAX_POINTS = 5                  # multi-area click: max click points
 IDLE_THRESHOLD_SECONDS = 3.0    # polite mode: user must be idle this long
 MAX_POLITE_DEFER_SECONDS = 90.0  # ...but never delay a due click longer than this
 POLITE_MIN_INTERVAL = 10.0      # polite mode only kicks in for intervals >= this
+
+TEMPLATE_HALF = 42              # half-size of the captured anchor patch (px)
+MATCH_MAX_DIM = 1200            # downscale capture to this before matching (speed)
+MATCH_THRESHOLD = 0.78          # min confidence to click in Smart Find mode
 
 UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600}
 
@@ -373,17 +387,8 @@ def cursor_click_window(hwnd, fx, fy):
     return True
 
 
-def post_click(hwnd, fx, fy, client_size):
-    """Deliver a click at a client-area fraction using window messages only.
-
-    The message is posted to the deepest child window under the point (that is
-    who actually handles clicks in real apps), with coordinates mapped into
-    that child's client space. The physical cursor is never touched.
-    """
-    w, h = client_size
-    cx = round(fx * max(w - 1, 1))
-    cy = round(fy * max(h - 1, 1))
-
+def post_click_px(hwnd, cx, cy):
+    """Post a left-click at client pixel (cx, cy) to the deepest child there."""
     target = hwnd
     for _ in range(16):
         child = user32.RealChildWindowFromPoint(target, POINT(cx, cy))
@@ -399,6 +404,17 @@ def post_click(hwnd, fx, fy, client_size):
     time.sleep(0.02)
     ok_up = user32.PostMessageW(target, WM_LBUTTONUP, 0, lparam)
     return bool(ok_down and ok_up)
+
+
+def post_click(hwnd, fx, fy, client_size):
+    """Deliver a click at a client-area fraction using window messages only.
+
+    The message is posted to the deepest child window under the point (that is
+    who actually handles clicks in real apps), with coordinates mapped into
+    that child's client space. The physical cursor is never touched.
+    """
+    w, h = client_size
+    return post_click_px(hwnd, round(fx * max(w - 1, 1)), round(fy * max(h - 1, 1)))
 
 
 def _send_mouse(flags, nx=0, ny=0):
@@ -428,6 +444,83 @@ def resource_path(rel):
     """Path to a bundled resource, both in dev and in the PyInstaller exe."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, rel)
+
+
+# ---------------------------------------------------------------------------
+# Screen capture (GDI) for visual anchoring
+# ---------------------------------------------------------------------------
+
+SRCCOPY = 0x00CC0020
+CAPTUREBLT = 0x40000000
+DIB_RGB_COLORS = 0
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint), ("biWidth", ctypes.c_int),
+                ("biHeight", ctypes.c_int), ("biPlanes", ctypes.c_ushort),
+                ("biBitCount", ctypes.c_ushort), ("biCompression", ctypes.c_uint),
+                ("biSizeImage", ctypes.c_uint), ("biXPelsPerMeter", ctypes.c_int),
+                ("biYPelsPerMeter", ctypes.c_int), ("biClrUsed", ctypes.c_uint),
+                ("biClrImportant", ctypes.c_uint)]
+
+
+if IS_WINDOWS:
+    gdi32 = ctypes.windll.gdi32
+    for _fn in ("CreateCompatibleDC", "CreateCompatibleBitmap", "SelectObject",
+                "DeleteObject", "DeleteDC", "BitBlt", "GetDIBits"):
+        getattr(gdi32, _fn).restype = ctypes.c_void_p if _fn.startswith("Create") \
+            or _fn == "SelectObject" else ctypes.c_int
+    gdi32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi32.CreateCompatibleBitmap.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    gdi32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    gdi32.DeleteObject.argtypes = [ctypes.c_void_p]
+    gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
+    gdi32.BitBlt.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    gdi32.GetDIBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint,
+                                ctypes.c_uint, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_uint]
+    user32.GetDC.argtypes = [ctypes.c_void_p]
+    user32.GetDC.restype = ctypes.c_void_p
+    user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+
+def capture_screen_region(x, y, w, h):
+    """Grab a screen rectangle as an (h, w, 4) BGRA numpy array, or None.
+
+    Captures the composited screen, so it sees whatever is actually drawn
+    there — including remote-desktop content — provided the region is not
+    occluded by another window.
+    """
+    if not HAS_VISION or w <= 0 or h <= 0:
+        return None
+    hdc_screen = user32.GetDC(None)
+    if not hdc_screen:
+        return None
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+    old = gdi32.SelectObject(hdc_mem, hbmp)
+    try:
+        if not gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y,
+                            SRCCOPY | CAPTUREBLT):
+            return None
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = w
+        bmi.biHeight = -h          # negative => top-down rows
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        buf = (ctypes.c_ubyte * (w * h * 4))()
+        if gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, ctypes.byref(bmi),
+                           DIB_RGB_COLORS) == 0:
+            return None
+        return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4).copy()
+    finally:
+        gdi32.SelectObject(hdc_mem, old)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(None, hdc_screen)
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +809,12 @@ class AutoClickerApp:
         self._last_injection = -1e9   # monotonic time of our last real-input click
         self._testing = False
 
+        self.templates = []           # parallel to self.points; numpy arrays or None
+        self.last_match_score = None
+        self._matching = False        # a visual match is in flight
+        self._match_q = None
+        self._click_ctx = None
+
         self.bar = None
         self.overlay = None
         self.picker = None
@@ -881,6 +980,20 @@ class AutoClickerApp:
                        selectcolor=COL_CARD_HI, activebackground=COL_BG,
                        activeforeground=COL_TEXT, font=(FONT, 9),
                        highlightthickness=0, cursor="hand2").pack(anchor="w")
+        self.smart_var = tk.BooleanVar(value=HAS_VISION)
+        smart_cb = tk.Checkbutton(
+            method_row,
+            text="🔎 Smart Find — locate the target by its picture "
+                 "(survives resizing in Horizon/Citrix; skips if unsure)",
+            variable=self.smart_var, bg=COL_BG, fg=COL_SUB,
+            selectcolor=COL_CARD_HI, activebackground=COL_BG,
+            activeforeground=COL_TEXT, font=(FONT, 9),
+            highlightthickness=0, cursor="hand2")
+        smart_cb.pack(anchor="w")
+        if not HAS_VISION:
+            self.smart_var.set(False)
+            smart_cb.config(state="disabled",
+                            text="🔎 Smart Find — unavailable (numpy not bundled)")
 
         # Start
         self.start_button = pill_button(outer, "▶   Start clicking",
@@ -1102,11 +1215,9 @@ class AutoClickerApp:
             self.points = list(picked)
             self.point_index = 0
             self._close_overlay()
-            save_config(self._current_config())
-            fx, fy = self.points[0]
-            self._flash_marker(sx + round(fx * (w - 1)), sy + round(fy * (h - 1)),
-                               number=1 if len(self.points) > 1 else None)
-            self._finish_pick()
+            # capture appearance templates while the target is still frontmost
+            # and our own window is hidden (short delay lets the screen redraw)
+            self.root.after(160, lambda: self._grab_templates_and_finish(sx, sy, w, h))
 
         def on_cancel(_e=None):
             self._close_overlay()
@@ -1136,6 +1247,58 @@ class AutoClickerApp:
         else:
             self._hint(f"{len(self.points)} points saved. "
                        "Use Test click to verify them.")
+
+    def _grab_templates_and_finish(self, sx, sy, w, h):
+        self.templates = self._capture_templates(sx, sy, w, h, self.points)
+        save_config(self._current_config())
+        fx, fy = self.points[0]
+        self._flash_marker(sx + round(fx * (w - 1)), sy + round(fy * (h - 1)),
+                           number=1 if len(self.points) > 1 else None)
+        self._finish_pick()
+
+    def _capture_templates(self, sx, sy, w, h, points):
+        """Grab a small appearance patch around each point (grayscale uint8).
+
+        A featureless patch (e.g. a blank area) is stored as None so that
+        point falls back to percentage-based clicking — Smart Find can only
+        anchor to something visually distinctive.
+        """
+        tpls = [None] * len(points)
+        if not HAS_VISION:
+            return tpls
+        shot = capture_screen_region(sx, sy, w, h)
+        if shot is None:
+            return tpls
+        gray = np.clip(vm.to_gray(shot), 0, 255).astype(np.uint8)
+        H, W = gray.shape
+        for i, (fx, fy) in enumerate(points):
+            cx, cy = int(fx * (W - 1)), int(fy * (H - 1))
+            x0, x1 = max(0, cx - TEMPLATE_HALF), min(W, cx + TEMPLATE_HALF)
+            y0, y1 = max(0, cy - TEMPLATE_HALF), min(H, cy + TEMPLATE_HALF)
+            patch = gray[y0:y1, x0:x1]
+            if patch.shape[0] >= 12 and patch.shape[1] >= 12 and patch.std() >= 6.0:
+                tpls[i] = patch.copy()
+        return tpls
+
+    def _match_once(self, sx, sy, w, h, template):
+        """Capture the client area and locate `template`; returns match dict
+        {score, cx, cy} in client pixels, or None. Safe to call off-thread."""
+        shot = capture_screen_region(sx, sy, w, h)
+        if shot is None:
+            return None
+        gray = vm.to_gray(shot)
+        templ = np.asarray(template, dtype=np.float32)
+        H, W = gray.shape
+        s = 1.0
+        big = max(H, W)
+        if big > MATCH_MAX_DIM:
+            s = MATCH_MAX_DIM / big
+            gray = vm.resize_bilinear(gray, H * s, W * s)
+            templ = vm.resize_bilinear(templ, templ.shape[0] * s, templ.shape[1] * s)
+        res = vm.find(gray, templ)
+        if res is None:
+            return None
+        return {"score": res["score"], "cx": res["cx"] / s, "cy": res["cy"] / s}
 
     def _flash_marker(self, sx, sy, rings=9, number=None):
         """Animated crosshair rings at a screen point, click-through by look."""
@@ -1220,15 +1383,22 @@ class AutoClickerApp:
         ok = post_click(self.target_hwnd, fx, fy, size)
         return "ok" if ok else "blocked"
 
-    def _next_fraction(self):
-        """Pick which point to click next, honoring the order setting."""
-        if len(self.points) == 1:
-            return self.points[0]
-        if self.order_var.get() == "random":
-            return random.choice(self.points)
-        fraction = self.points[self.point_index % len(self.points)]
-        self.point_index = (self.point_index + 1) % len(self.points)
-        return fraction
+    def _next_point(self):
+        """Pick which point to click next, honoring the order setting.
+        Returns (index, fx, fy, template_or_None)."""
+        if len(self.points) <= 1:
+            i = 0
+        elif self.order_var.get() == "random":
+            i = random.randrange(len(self.points))
+        else:
+            i = self.point_index % len(self.points)
+            self.point_index = (self.point_index + 1) % len(self.points)
+        fx, fy = self.points[i]
+        tpl = self.templates[i] if i < len(self.templates) else None
+        return i, fx, fy, tpl
+
+    def _use_visual(self, template):
+        return (self.smart_var.get() and HAS_VISION and template is not None)
 
     def _test_click(self):
         if not self.points:
@@ -1245,10 +1415,40 @@ class AutoClickerApp:
     def _test_step(self, i):
         if i >= len(self.points):
             self._testing = False
-            if self.method_var.get() == "background":
+            if self.method_var.get() == "background" and not any(
+                    self._use_visual(t) for t in self.templates):
                 self.root.after(300, self._confirm_background_test)
             return
-        state = self._perform_click(self.points[i])
+        fx, fy = self.points[i]
+        tpl = self.templates[i] if i < len(self.templates) else None
+        label = f"point {i + 1}/{len(self.points)}" if len(self.points) > 1 else ""
+
+        if self._use_visual(tpl):
+            self._hint(f"🔎 Finding {label}…")
+            self.root.update_idletasks()
+            geom = self._target_geometry()
+            if geom is None:
+                self._testing = False
+                self._hint("Target window not found — reselect it in step 1.")
+                return
+            res = self._match_once(*geom, tpl)
+            score = res["score"] if res else 0.0
+            if res and score >= MATCH_THRESHOLD:
+                sx, sy, w, h = geom
+                cx = min(max(res["cx"], 0), w - 1)
+                cy = min(max(res["cy"], 0), h - 1)
+                if self.method_var.get() == "cursor":
+                    cursor_click_at(sx + int(round(cx)), sy + int(round(cy)))
+                else:
+                    post_click_px(self.target_hwnd, int(round(cx)), int(round(cy)))
+                self._hint(f"Found & clicked {label} ({score * 100:.0f}% match) ✓")
+            else:
+                self._hint(f"Could NOT find {label} ({score * 100:.0f}%) — "
+                           "would skip. Try re-picking on a distinctive spot.")
+            self.root.after(650, self._test_step, i + 1)
+            return
+
+        state = self._perform_click((fx, fy))
         if state != "ok":
             self._testing = False
             self._hint({"blocked": "Click was blocked — the target may need "
@@ -1256,7 +1456,6 @@ class AutoClickerApp:
                         "lost": "Target window not found — reselect it in "
                                 "step 1."}[state])
             return
-        label = f"point {i + 1}/{len(self.points)}" if len(self.points) > 1 else ""
         self._hint(f"Test click sent {label} ✓")
         self.root.after(500, self._test_step, i + 1)
 
@@ -1279,11 +1478,18 @@ class AutoClickerApp:
     def _current_config(self):
         cfg = {"value": self.value_var.get(), "unit": self.unit_var.get(),
                "method": self.method_var.get(), "order": self.order_var.get(),
-               "polite": bool(self.polite_var.get())}
+               "polite": bool(self.polite_var.get()),
+               "smart": bool(self.smart_var.get())}
         if self.target_title:
             cfg["window_title"] = self.target_title
         if self.points:
             cfg["points"] = [[fx, fy] for fx, fy in self.points]
+        if any(t is not None for t in self.templates):
+            cfg["templates"] = [
+                None if t is None else
+                {"h": int(t.shape[0]), "w": int(t.shape[1]),
+                 "d": base64.b64encode(t.tobytes()).decode("ascii")}
+                for t in self.templates]
         return cfg
 
     def _restore_saved_config(self):
@@ -1295,6 +1501,7 @@ class AutoClickerApp:
             self.points = []
         if not self.points and "fx" in cfg and "fy" in cfg:   # pre-2.2 config
             self.points = [(float(cfg["fx"]), float(cfg["fy"]))]
+        self.templates = self._deserialize_templates(cfg.get("templates"))
         if "value" in cfg:
             self.value_var.set(str(cfg["value"]))
         if cfg.get("unit") in UNIT_SECONDS:
@@ -1305,6 +1512,23 @@ class AutoClickerApp:
             self.order_var.set(cfg["order"])
         if isinstance(cfg.get("polite"), bool):
             self.polite_var.set(cfg["polite"])
+        if HAS_VISION and isinstance(cfg.get("smart"), bool):
+            self.smart_var.set(cfg["smart"])
+
+    def _deserialize_templates(self, data):
+        tpls = [None] * len(self.points)
+        if not HAS_VISION or not isinstance(data, list):
+            return tpls
+        for i in range(min(len(data), len(tpls))):
+            d = data[i]
+            if isinstance(d, dict):
+                try:
+                    raw = base64.b64decode(d["d"])
+                    tpls[i] = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        int(d["h"]), int(d["w"])).copy()
+                except Exception:
+                    tpls[i] = None
+        return tpls
         title = cfg.get("window_title")
         if title and self.target_hwnd is None:
             self.target_title = title
@@ -1344,6 +1568,9 @@ class AutoClickerApp:
         self.remaining_when_paused = None
         self.last_click_state = "ok"
         self.waiting_for_idle = False
+        self._matching = False
+        self._match_q = None
+        self.last_match_score = None
         self.next_click_at = time.monotonic() + self.interval
 
         self.root.withdraw()
@@ -1428,19 +1655,118 @@ class AutoClickerApp:
         if self.bar is None:
             return
         now = time.monotonic()
-        if not self.paused and now >= self.next_click_at:
+        if not self.paused and not self._matching and now >= self.next_click_at:
             if self._should_defer_for_idle(now):
                 self.waiting_for_idle = True
             else:
                 self.waiting_for_idle = False
-                self.last_click_state = self._perform_click(self._next_fraction())
-                if self.last_click_state == "ok":
-                    self.click_count += 1
-                # schedule from "now" so a slow tick can't cause a click burst
-                self.next_click_at = time.monotonic() + self.interval
+                self._begin_click()
+        self._poll_match()
         self._update_status()
         self._keep_bar_on_screen()
         self._schedule_tick()
+
+    def _begin_click(self):
+        idx, fx, fy, tpl = self._next_point()
+        if self._use_visual(tpl):
+            self._begin_visual_click(fx, fy, tpl)
+        else:
+            self.last_click_state = self._perform_click((fx, fy))
+            if self.last_click_state == "ok":
+                self.click_count += 1
+            self.next_click_at = time.monotonic() + self.interval
+
+    def _begin_visual_click(self, fx, fy, tpl):
+        """Start an asynchronous locate-then-click for one point."""
+        if self.target_hwnd is None or not user32.IsWindow(self.target_hwnd):
+            if not self._reattach_window():
+                self.last_click_state = "lost"
+                self.next_click_at = time.monotonic() + self.interval
+                return
+        geom = self._target_geometry()
+        if geom is None:
+            self.last_click_state = "lost"
+            self.next_click_at = time.monotonic() + self.interval
+            return
+        sx, sy, w, h = geom
+        px, py = sx + round(fx * (w - 1)), sy + round(fy * (h - 1))
+        root_target = user32.GetAncestor(self.target_hwnd, GA_ROOT)
+        hit = user32.WindowFromPoint(POINT(px, py))
+        covered = not hit or user32.GetAncestor(hit, GA_ROOT) != root_target
+        method = self.method_var.get()
+
+        self._click_ctx = {"geom": geom, "root": root_target, "method": method,
+                           "tpl": tpl, "covered": covered,
+                           "prev": user32.GetForegroundWindow(), "prev_above": None}
+        self._matching = True
+        if covered and method == "cursor":
+            self._click_ctx["prev_above"] = user32.GetWindow(root_target, GW_HWNDPREV)
+            force_foreground(root_target)
+            self.root.after(180, self._capture_and_match)
+        else:
+            self._capture_and_match()
+
+    def _capture_and_match(self):
+        ctx = self._click_ctx
+        geom = self._target_geometry() or ctx["geom"]
+        ctx["geom"] = geom
+        sx, sy, w, h = geom
+        tpl = ctx["tpl"]
+        self._match_q = queue.Queue()
+
+        def work():
+            try:
+                self._match_q.put(self._match_once(sx, sy, w, h, tpl))
+            except Exception:
+                self._match_q.put(None)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_match(self):
+        if not self._matching or self._match_q is None:
+            return
+        try:
+            res = self._match_q.get_nowait()
+        except queue.Empty:
+            return
+        self._match_q = None
+        self._finish_visual(res)
+
+    def _finish_visual(self, res):
+        ctx = self._click_ctx
+        sx, sy, w, h = ctx["geom"]
+        self.last_match_score = res["score"] if res else 0.0
+        if self.paused or self.bar is None:
+            # user paused/stopped while the match was in flight — don't click
+            self._matching = False
+            self._click_ctx = None
+            return
+        if res and res["score"] >= MATCH_THRESHOLD:
+            cx = min(max(res["cx"], 0), w - 1)
+            cy = min(max(res["cy"], 0), h - 1)
+            if ctx["method"] == "cursor":
+                cursor_click_at(sx + int(round(cx)), sy + int(round(cy)))
+                self._last_injection = time.monotonic()
+            else:
+                post_click_px(self.target_hwnd, int(round(cx)), int(round(cy)))
+            self.last_click_state = "ok"
+            self.click_count += 1
+        else:
+            self.last_click_state = "notfound"
+
+        # restore focus / z-order if we raised the window to click it
+        if ctx["covered"] and ctx["method"] == "cursor":
+            prev, above = ctx.get("prev"), ctx.get("prev_above")
+            if (prev and prev != ctx["root"] and user32.IsWindow(prev)
+                    and user32.GetForegroundWindow() != prev):
+                user32.SetForegroundWindow(prev)
+            if above and user32.IsWindow(above):
+                user32.SetWindowPos(ctx["root"], above, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+
+        self._matching = False
+        self._click_ctx = None
+        self.next_click_at = time.monotonic() + self.interval
 
     def _should_defer_for_idle(self, now):
         """Polite mode: hold a due real-cursor click while the user is active.
@@ -1477,6 +1803,17 @@ class AutoClickerApp:
             dot = COL_RED
             text = "Clicks blocked — try running as admin"
             fg = COL_RED
+        elif self._matching:
+            dot = COL_ACCENT if self._pulse_on else "#1e3a6b"
+            text = f"🔎 Finding target…  •  {self.click_count} clicks"
+            fg = COL_ACCENT
+        elif self.last_click_state == "notfound":
+            dot = COL_AMBER
+            pct = f"{self.last_match_score * 100:.0f}%" if self.last_match_score else "0%"
+            remaining = self.next_click_at - time.monotonic()
+            text = (f"Target not found ({pct}) — skipped, retry in "
+                    f"{format_duration(remaining)}  •  {self.click_count} clicks")
+            fg = COL_AMBER
         elif self.waiting_for_idle:
             dot = COL_AMBER if self._pulse_on else "#7a5c14"
             text = f"Waiting until you're idle…  •  {self.click_count} clicks"
@@ -1517,6 +1854,8 @@ class AutoClickerApp:
         self.remaining_when_paused = None
         self.last_click_state = "ok"
         self.waiting_for_idle = False
+        self._matching = False
+        self._match_q = None
         self.next_click_at = time.monotonic() + self.interval
         self.pause_button.config(text="⏸ Pause")
         self._update_status()
@@ -1525,6 +1864,9 @@ class AutoClickerApp:
         if self._tick_job is not None:
             self.root.after_cancel(self._tick_job)
             self._tick_job = None
+        self._matching = False
+        self._match_q = None
+        self._click_ctx = None
         if self.bar is not None:
             self.bar.destroy()
             self.bar = None

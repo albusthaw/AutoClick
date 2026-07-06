@@ -2,7 +2,7 @@
 REM Build AutoClicker.exe locally on Windows.
 REM Requires Python 3.9+ installed and on PATH.
 
-pip install pyinstaller || exit /b 1
+pip install pyinstaller numpy || exit /b 1
 python build_assets.py || exit /b 1
 pyinstaller --onefile --noconsole --noupx --name AutoClicker ^
   --icon assets/icon.ico --version-file version_info.txt ^

@@ -30,6 +30,7 @@ You can always audit the code (it's one Python file) and build the exe yourself 
 
 ## ✨ Features
 
+- 🔎 **Smart Find (visual anchoring)** — instead of clicking blindly at a saved coordinate, AutoClicker remembers what the target *looks like* and finds it in the window before clicking, searching across sizes so it **keeps working after you resize the Horizon/Citrix window**. If it can't find the target confidently, it **skips rather than misclicking**
 - 🪟 **Graphical window picker** — choose the target from a grid of **live window previews** (like the Windows taskbar previews), not a text list
 - 🎯 **Multiple click areas** — pick up to 5 points in one go; they're clicked one per interval, **in the order you picked them (looping)** or **randomly**
 - 🕊 **Idle-aware clicking** — in real-cursor mode the app waits until *you* haven't touched the mouse/keyboard for a few seconds before clicking, so it never interrupts your work (a due click is never held more than 90 s, so keep-alive still keeps alive)
@@ -48,7 +49,8 @@ You can always audit the code (it's one Python file) and build the exe yourself 
 1. Run `AutoClicker.exe`.
 2. **Step 1 — Target window**: press **🪟 Choose…** and click the window in the live-preview grid.
 3. **Step 2 — Click points**: press **🎯 Pick points**. The target window comes to the front with a translucent blue overlay — click up to **5 spots** in the order you want them clicked (right-click or Enter when done, Esc to cancel). The points appear numbered on the mini-preview. Choose **In order (loop)** or **Random** for how they advance — each interval clicks *one* point, then moves to the next.
-4. **Test it**: press **🖱 Test click**. In background mode the app then asks whether the click actually registered — if it didn't (typical for remote-desktop windows), it switches to Real cursor mode automatically so you can test again.
+   - **🔎 Smart Find** (recommended for Horizon/Citrix, on by default): when you pick each point, AutoClicker also snapshots a small picture around it. At click time it locates that picture in the window — so clicks stay accurate even after you resize the remote window. Pick points on something *visually distinctive* (a button, an icon, text) rather than a blank area, or Smart Find can't anchor to it and that point falls back to percentage-based clicking.
+4. **Test it**: press **🖱 Test click**. With Smart Find on, it reports the match confidence per point ("Found & clicked 92% ✓" or "Could NOT find — would skip"). In plain background mode it instead asks whether the click registered — if not (typical for remote-desktop windows), it switches to Real cursor mode automatically.
 5. **Step 3 — Frequency**: e.g. every `30 seconds`, `5 minutes` or `1 hours`.
 6. Press **▶ Start clicking**. The window collapses into a slim always-on-top bar:
    - **⏸ Pause / ▶ Resume** — temporarily stop clicking
@@ -58,7 +60,15 @@ You can always audit the code (it's one Python file) and build the exe yourself 
 
 ## 🧠 How it works
 
-**Resolution independence.** The click point is saved as a fraction of the target window's *client area* (e.g. "37% across, 62% down"), never as a pixel. Each click re-reads the window's current size and position, so the same relative spot gets clicked at any resolution, window size, or DPI — exactly what you need when a VM's resolution changes between phone, iPad and desktop RDP sessions.
+**Smart Find (visual anchoring) — the fix for resize misclicks.** Percentage-based clicking assumes the window's content scales linearly with the window. Remote-desktop clients break that assumption: when you resize a Horizon/Citrix window, the remote image inside it gets **letterboxed, scaled non-linearly, or panned**, so "50% across the client area" stops pointing at the same remote pixel — and you get clicks landing in the wrong place. Smart Find solves this by *recognizing the target visually*:
+
+1. When you pick a point, a small grayscale patch around it is captured and saved (in `%APPDATA%\AutoClicker`, base64 in the config).
+2. Before each click, AutoClicker screenshots the window's client area and runs **multi-scale normalized cross-correlation** to locate that patch — trying a range of sizes (0.5×–1.6×) so the target is found even after the window (and thus the rendered content) is resized.
+3. It clicks the *found* location. If the best match confidence is below ~78%, it **does not click at all** — a skipped keep-alive is always better than a click in the wrong place. The control bar shows "target not found — skipped" so you know.
+
+Matching runs on a background thread (so the control bar stays responsive) and only every interval, so the cost is negligible. It needs a *visually distinctive* target; a blank area has nothing to anchor to and automatically falls back to percentage mode.
+
+**Resolution independence (percentage mode).** When Smart Find is off (or the target isn't distinctive), the click point is saved as a fraction of the target window's *client area* (e.g. "37% across, 62% down"), never as a pixel. Each click re-reads the window's current size and position, so the same relative spot gets clicked at any resolution, window size, or DPI. This works well for **normal application windows** and for remote windows in a simple stretch/fit display mode; it's the case that drifts when a remote client letterboxes or pans — which is exactly what Smart Find is for.
 
 **Background mode.** Clicks are posted directly to the target window (down to the exact child control under the point) as `WM_LBUTTONDOWN`/`WM_LBUTTONUP` messages. The physical cursor never moves, the target window doesn't need to be in front, and your own mouse/keyboard activity is untouched. Works for most normal applications.
 
@@ -95,6 +105,9 @@ What AutoClicker does to make real-cursor clicks barely noticeable: **idle-aware
 | Target app runs as administrator | Windows blocks messages from normal apps (bar shows "blocked") — run AutoClicker as administrator too |
 | Remote-desktop / games with raw input | Background mode is ignored — use *Real cursor* mode (auto-detected for known clients) |
 | Real-cursor mode while you're typing/clicking | The cursor teleports to the target for ~50 ms per click, then returns; focus is restored. Brief, but not invisible |
+| Smart Find target is a blank/uniform area | Nothing to recognize — that point automatically falls back to percentage-based clicking (pick a button/icon/text instead) |
+| Control bar sits over the click point | In real-cursor mode the click could hit the bar — drag the bar away from the target area |
+| Remote window fully hidden/minimized at click time | Screenshot can't see the target → Smart Find skips that click (no misclick) until it's visible again |
 | Window minimized | Background clicks use the last known window size; some apps ignore clicks while minimized — keep the window restored (it can be behind other windows) |
 | Locked / signed-out session | Windows delivers no input to a locked desktop — keep the VM session signed in |
 
@@ -104,7 +117,7 @@ What AutoClicker does to make real-cursor clicks barely noticeable: **idle-aware
 build.bat
 ```
 
-Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows; the app itself is pure standard library (tkinter + ctypes), and only PyInstaller is needed for packaging. The icon and Windows version resource are generated by `build_assets.py` (also pure stdlib). You can also run the app directly with `python autoclicker.py`.
+Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows. The app uses tkinter + ctypes (standard library) plus **numpy** for Smart Find's image matching; `build.bat` installs numpy and PyInstaller for you. The icon and Windows version resource are generated by `build_assets.py` (pure stdlib). You can also run the app directly with `python autoclicker.py` (with numpy installed; without it, everything works except Smart Find).
 
 ## 📦 Releases & versioning
 
@@ -112,6 +125,10 @@ Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows; the app itself
 - This README is updated with each release — changelog below.
 
 ## 📝 Changelog
+
+### v2.3.0
+- **Smart Find (visual anchoring)** — the fix for misclicks after resizing a Horizon/Citrix window. AutoClicker now captures a picture of each target when you pick it and locates it visually before clicking (multi-scale normalized cross-correlation on a background thread), so clicks track the target across window resizing/scaling. Below ~78% confidence it skips instead of misclicking; featureless targets fall back to percentage mode automatically. Per-point confidence is shown in Test click and the control bar. Adds a numpy dependency (bundled in the exe)
+- Click delivery refactored to support located coordinates in both Background and Real-cursor modes; templates and the Smart Find setting persist between runs
 
 ### v2.2.0
 - **Multiple click areas**: pick up to 5 points in one overlay session (numbered markers); one point is clicked per interval, advancing **in order with a loop** or **randomly** — works in both Background and Real-cursor modes
