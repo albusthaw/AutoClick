@@ -24,6 +24,10 @@ This is an unsigned open-source tool (code-signing certificates cost hundreds of
 
 You can always audit the code (it's one Python file) and build the exe yourself with `build.bat`.
 
+**If Defender names a specific threat** (typically `Wacatac`/`Wacapew` with an `!ml` suffix — meaning "machine-learning guess", not an actual signature match): that's a false positive you can help clear for everyone. Submit the file at [Microsoft's false-positive portal](https://www.microsoft.com/en-us/wdsi/filesubmission) (choose *Software developer* → *Incorrectly detected*). Microsoft usually re-classifies within 1–3 days, which whitelists that exact file globally.
+
+**What the app does and doesn't do** (auditable in `autoclicker.py`): it simulates mouse clicks (`SendInput`/`PostMessage`), lists window titles for the picker, and stores its settings in `%APPDATA%\AutoClicker`. It contains **no** networking, no keyboard capture or hooks, no process injection, no registry access, and no autostart — the flag comes from "simulates input + unsigned + Python-packed exe" pattern-matching, not from any actual behavior.
+
 ## ✨ Features
 
 - 🪟 **Graphical window picker** — choose the target from a grid of **live window previews** (like the Windows taskbar previews), not a text list
@@ -90,6 +94,10 @@ Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows; the app itself
 - This README is updated with each release — changelog below.
 
 ## 📝 Changelog
+
+### v2.1.1
+- Antivirus-review release: removed the `AttachThreadInput` focus-restore workaround — the one API pattern in the app strongly associated with malware. Focus restore now uses plain `SetForegroundWindow` only (may occasionally be refused by Windows; clicking is unaffected)
+- Documented the app's full API surface and the Microsoft false-positive submission process in the README
 
 ### v2.1.0
 - **Remote-desktop support**: Real-cursor mode reworked for RDP / Omnissa Horizon / Citrix windows (incl. nested sessions like Horizon inside RDP) — raises the window only when covered, clicks with hardware input, restores cursor and gives focus back to what you were doing

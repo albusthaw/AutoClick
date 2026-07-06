@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -161,7 +161,6 @@ if IS_WINDOWS:
     user32.GetForegroundWindow.restype = ctypes.c_void_p
     user32.WindowFromPoint.argtypes = [POINT]
     user32.WindowFromPoint.restype = ctypes.c_void_p
-    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
     dwmapi = ctypes.windll.dwmapi
     dwmapi.DwmRegisterThumbnail.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
@@ -278,22 +277,14 @@ def bring_to_front(hwnd):
 
 
 def force_foreground(hwnd):
-    """SetForegroundWindow with the AttachThreadInput fallback for when
-    Windows refuses to let a background process steal focus."""
+    """Best-effort focus change. Windows may refuse focus changes from a
+    background process; we accept that rather than use workarounds
+    (AttachThreadInput etc.) that antivirus heuristics rightly dislike."""
     if user32.GetForegroundWindow() == hwnd:
         return
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
-    if user32.SetForegroundWindow(hwnd):
-        return
-    fg = user32.GetForegroundWindow()
-    cur = ctypes.windll.kernel32.GetCurrentThreadId()
-    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-    if fg_thread and fg_thread != cur:
-        user32.AttachThreadInput(fg_thread, cur, True)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-        user32.AttachThreadInput(fg_thread, cur, False)
+    user32.SetForegroundWindow(hwnd)
 
 
 def looks_like_remote_client(hwnd, title):
