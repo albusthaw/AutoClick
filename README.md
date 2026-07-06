@@ -31,6 +31,8 @@ You can always audit the code (it's one Python file) and build the exe yourself 
 ## ✨ Features
 
 - 🪟 **Graphical window picker** — choose the target from a grid of **live window previews** (like the Windows taskbar previews), not a text list
+- 🎯 **Multiple click areas** — pick up to 5 points in one go; they're clicked one per interval, **in the order you picked them (looping)** or **randomly**
+- 🕊 **Idle-aware clicking** — in real-cursor mode the app waits until *you* haven't touched the mouse/keyboard for a few seconds before clicking, so it never interrupts your work (a due click is never held more than 90 s, so keep-alive still keeps alive)
 - 🫥 **True background clicking** — clicks are sent as window messages, so the mouse cursor never moves and you can keep working in other apps while it runs
 - 🖱 **Real-cursor mode for remote-desktop windows** — RDP / Omnissa Horizon / Citrix windows only forward *real* input; this mode clicks physically, then instantly restores your cursor and gives focus back to the window you were using. Remote-client windows are detected automatically and the right mode is pre-selected
 - 📐 **Resolution-independent** — the click point is stored as a *percentage of the window*, recalculated at every click, so it adapts when the screen resolution or window size changes (RDP from phone/iPad/PC)
@@ -45,7 +47,7 @@ You can always audit the code (it's one Python file) and build the exe yourself 
 
 1. Run `AutoClicker.exe`.
 2. **Step 1 — Target window**: press **🪟 Choose…** and click the window in the live-preview grid.
-3. **Step 2 — Click point**: press **🎯 Pick point**. The target window comes to the front with a translucent blue overlay — click the exact spot you want auto-clicked. An animated crosshair flashes where you picked, and the point appears on the mini-preview.
+3. **Step 2 — Click points**: press **🎯 Pick points**. The target window comes to the front with a translucent blue overlay — click up to **5 spots** in the order you want them clicked (right-click or Enter when done, Esc to cancel). The points appear numbered on the mini-preview. Choose **In order (loop)** or **Random** for how they advance — each interval clicks *one* point, then moves to the next.
 4. **Test it**: press **🖱 Test click**. In background mode the app then asks whether the click actually registered — if it didn't (typical for remote-desktop windows), it switches to Real cursor mode automatically so you can test again.
 5. **Step 3 — Frequency**: e.g. every `30 seconds`, `5 minutes` or `1 hours`.
 6. Press **▶ Start clicking**. The window collapses into a slim always-on-top bar:
@@ -68,6 +70,22 @@ You can always audit the code (it's one Python file) and build the exe yourself 
 4. If a different window had focus before, focus is handed back to it.
 
 AutoClicker detects remote-client windows by name/class and pre-selects this mode for them; the **Test click** confirmation flow catches any app it doesn't know about.
+
+### Can clicks into a remote-desktop window ever be truly silent?
+
+Short answer: **not from outside the session** — and any tool claiming otherwise is fighting Windows physics. Every injection path was reviewed for this app:
+
+| Approach | Result |
+|---|---|
+| Posted window messages (`PostMessage`/`SendMessage`) | Ignored — remote clients read **raw input**, not messages (this is AutoClicker's Background mode; great for normal apps) |
+| UI Automation (`InvokePattern`) | The remote session is a video stream — there are no UI elements to invoke |
+| Journal playback hooks | Disabled by Windows since Vista for security |
+| Synthetic touch/pen injection (`InjectSyntheticPointerInput`) | Still real input: activates the window and steals focus — same interference, less compatibility |
+| Real cursor click (`SendInput`) | **The only thing remote clients forward** — so AutoClicker makes it as gentle as possible |
+
+What AutoClicker does to make real-cursor clicks barely noticeable: **idle-aware timing** (waits until you're not using mouse/keyboard), raise-only-if-covered with **z-order restore**, **cursor restore** in ~50 ms, and **focus give-back** to the window you were using.
+
+💡 **The one truly silent setup**: run AutoClicker *inside* the remote session (copy the exe into the Horizon/RDP desktop and target the actual application window there). Inside the session the target is a real app — Background mode works, nothing on your outer desktop is touched, and it keeps clicking even while you're disconnected (as long as the session stays signed in).
 
 ### Limitations
 
@@ -94,6 +112,12 @@ Produces `dist\AutoClicker.exe`. Requires Python 3.9+ on Windows; the app itself
 - This README is updated with each release — changelog below.
 
 ## 📝 Changelog
+
+### v2.2.0
+- **Multiple click areas**: pick up to 5 points in one overlay session (numbered markers); one point is clicked per interval, advancing **in order with a loop** or **randomly** — works in both Background and Real-cursor modes
+- **Idle-aware clicking (🕊)**: real-cursor clicks wait until you haven't touched mouse/keyboard for ~3 s (capped at 90 s so keep-alive isn't starved); the control bar shows "waiting until you're idle"; the app's own injected clicks don't count as activity
+- **Less intrusive real-cursor clicks**: focus is now *always* returned to the window you were using, and when the target had to be raised, its z-order position is restored afterwards
+- Documented the full review of silent-click approaches and the run-inside-the-session setup for truly invisible clicking
 
 ### v2.1.1
 - Antivirus-review release: removed the `AttachThreadInput` focus-restore workaround — the one API pattern in the app strongly associated with malware. Focus restore now uses plain `SetForegroundWindow` only (may occasionally be refused by Windows; clicking is unaffected)

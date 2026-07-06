@@ -16,19 +16,25 @@ at a fixed interval.
 import ctypes
 import json
 import os
+import random
 import sys
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 APP_NAME = "AutoClicker"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 
 IS_WINDOWS = sys.platform == "win32"
 
 CAPTURE_SETTLE_MS = 450         # let the target window come to front before overlay
 MIN_INTERVAL_SECONDS = 0.2
 TICK_MS = 200
+
+MAX_POINTS = 5                  # multi-area click: max click points
+IDLE_THRESHOLD_SECONDS = 3.0    # polite mode: user must be idle this long
+MAX_POLITE_DEFER_SECONDS = 90.0  # ...but never delay a due click longer than this
+POLITE_MIN_INTERVAL = 10.0      # polite mode only kicks in for intervals >= this
 
 UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600}
 
@@ -78,7 +84,11 @@ MK_LBUTTON = 0x0001
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 GA_ROOT = 2
+GW_HWNDPREV = 3
 SW_RESTORE = 9
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
 DWMWA_CLOAKED = 14
 DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19
@@ -147,6 +157,10 @@ class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
                 ("fSourceClientAreaOnly", ctypes.c_int)]
 
 
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
 if IS_WINDOWS:
     user32 = ctypes.windll.user32
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
@@ -161,6 +175,11 @@ if IS_WINDOWS:
     user32.GetForegroundWindow.restype = ctypes.c_void_p
     user32.WindowFromPoint.argtypes = [POINT]
     user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    user32.GetWindow.restype = ctypes.c_void_p
+    user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_uint]
 
     dwmapi = ctypes.windll.dwmapi
     dwmapi.DwmRegisterThumbnail.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
@@ -287,6 +306,16 @@ def force_foreground(hwnd):
     user32.SetForegroundWindow(hwnd)
 
 
+def user_idle_seconds():
+    """Seconds since the last input event in this session (incl. injected)."""
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    if not user32.GetLastInputInfo(ctypes.byref(lii)):
+        return 1e9
+    tick = ctypes.windll.kernel32.GetTickCount()
+    return ((tick - lii.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
 def looks_like_remote_client(hwnd, title):
     """Remote-desktop client windows need Real-cursor mode."""
     haystack = (title + " " + _get_class_name(hwnd)).lower()
@@ -298,9 +327,11 @@ def cursor_click_window(hwnd, fx, fy):
     """Real-input click at a window fraction, as unobtrusive as possible.
 
     Remote-desktop clients (RDP, Omnissa Horizon, Citrix...) only forward
-    real input, so this sends a genuine click. The window is raised only if
-    something else covers the click point, the cursor is restored right
-    after, and the window you were working in gets focus back.
+    real input, so this sends a genuine click. To minimize interference:
+    the window is raised only if something covers the click point (and its
+    z-order position is restored afterwards), the cursor is restored right
+    after the click, and focus is always handed back to the window you
+    were working in.
     """
     geom = get_client_geometry(hwnd)
     if geom is None:
@@ -314,7 +345,11 @@ def cursor_click_window(hwnd, fx, fy):
     covered = not hit or user32.GetAncestor(hit, GA_ROOT) != root_target
 
     prev = user32.GetForegroundWindow()
+    prev_above = None
     if covered:
+        # remember who is directly above us in the z-order, raise, click,
+        # then slot the window back where it was
+        prev_above = user32.GetWindow(root_target, GW_HWNDPREV)
         force_foreground(hwnd)
         time.sleep(0.15)
         geom = get_client_geometry(hwnd)
@@ -326,9 +361,15 @@ def cursor_click_window(hwnd, fx, fy):
 
     cursor_click_at(px, py)
 
-    if covered and prev and prev != root_target and user32.IsWindow(prev):
-        time.sleep(0.08)
-        force_foreground(prev)
+    # give focus back to whatever the user was working in — the click above
+    # counts as our input, so Windows lets us change the foreground window
+    if prev and prev != root_target and user32.IsWindow(prev):
+        time.sleep(0.05)
+        if user32.GetForegroundWindow() != prev:
+            user32.SetForegroundWindow(prev)
+    if prev_above and user32.IsWindow(prev_above):
+        user32.SetWindowPos(root_target, prev_above, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
     return True
 
 
@@ -662,7 +703,8 @@ class AutoClickerApp:
         self.windows = []             # [(hwnd, title)] from last refresh
         self.target_hwnd = None
         self.target_title = None
-        self.fraction = None          # (fx, fy) inside the target client area
+        self.points = []              # [(fx, fy)] inside the target client area
+        self.point_index = 0          # next point to click in "order" mode
         self.interval = None
         self.click_count = 0
         self.paused = False
@@ -670,6 +712,9 @@ class AutoClickerApp:
         self.remaining_when_paused = None
         self.last_click_state = "ok"  # ok | blocked | lost
         self.cached_client_size = None
+        self.waiting_for_idle = False
+        self._last_injection = -1e9   # monotonic time of our last real-input click
+        self._testing = False
 
         self.bar = None
         self.overlay = None
@@ -770,16 +815,16 @@ class AutoClickerApp:
         pill_button(body1, "🪟  Choose…", COL_ACCENT, COL_ACCENT_HOVER,
                     self._choose_window).pack(side="left", padx=(8, 0))
 
-        # Step 2: click point
-        body2 = self._card(outer, 2, "Click point",
-                           "Pick the spot graphically — it is stored as a % of the window,\n"
-                           "so it adapts to any screen size or resolution.")
+        # Step 2: click points
+        body2 = self._card(outer, 2, "Click points",
+                           f"Pick up to {MAX_POINTS} spots graphically — stored as % of the\n"
+                           "window, so they adapt to any screen size or resolution.")
         self.preview = tk.Canvas(body2, width=272, height=140, bg=COL_CARD,
                                  highlightthickness=0)
         self.preview.pack()
         btns2 = tk.Frame(body2, bg=COL_CARD)
         btns2.pack(fill="x", pady=(10, 0))
-        pill_button(btns2, "🎯  Pick point", COL_ACCENT, COL_ACCENT_HOVER,
+        pill_button(btns2, "🎯  Pick points", COL_ACCENT, COL_ACCENT_HOVER,
                     self._pick_point).pack(side="left", expand=True, fill="x", padx=(0, 4))
         pill_button(btns2, "👁  Show", COL_CARD_HI, COL_BORDER,
                     self._show_point, fg=COL_TEXT).pack(side="left", expand=True,
@@ -787,6 +832,18 @@ class AutoClickerApp:
         pill_button(btns2, "🖱  Test click", COL_CARD_HI, COL_BORDER,
                     self._test_click, fg=COL_TEXT).pack(side="left", expand=True,
                                                         fill="x", padx=(4, 0))
+        order_row = tk.Frame(body2, bg=COL_CARD)
+        order_row.pack(fill="x", pady=(8, 0))
+        tk.Label(order_row, text="Click order:", bg=COL_CARD, fg=COL_SUB,
+                 font=(FONT, 9)).pack(side="left", padx=(0, 8))
+        self.order_var = tk.StringVar(value="order")
+        for value, label in (("order", "In order (loop)"), ("random", "Random")):
+            tk.Radiobutton(order_row, text=label, value=value,
+                           variable=self.order_var, bg=COL_CARD, fg=COL_SUB,
+                           selectcolor=COL_CARD_HI, activebackground=COL_CARD,
+                           activeforeground=COL_TEXT, font=(FONT, 9),
+                           highlightthickness=0, cursor="hand2",
+                           command=self._draw_preview).pack(side="left", padx=(0, 10))
 
         # Step 3: frequency
         body3 = self._card(outer, 3, "Frequency")
@@ -816,6 +873,14 @@ class AutoClickerApp:
                            selectcolor=COL_CARD_HI, activebackground=COL_BG,
                            activeforeground=COL_TEXT, font=(FONT, 9),
                            highlightthickness=0, cursor="hand2").pack(anchor="w")
+        self.polite_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(method_row,
+                       text="🕊 Wait until I'm idle before clicking "
+                            "(real-cursor mode: never interrupts your work)",
+                       variable=self.polite_var, bg=COL_BG, fg=COL_SUB,
+                       selectcolor=COL_CARD_HI, activebackground=COL_BG,
+                       activeforeground=COL_TEXT, font=(FONT, 9),
+                       highlightthickness=0, cursor="hand2").pack(anchor="w")
 
         # Start
         self.start_button = pill_button(outer, "▶   Start clicking",
@@ -923,24 +988,46 @@ class AutoClickerApp:
             c.create_oval(x0 + 5 + i * 9, y0 + 3, x0 + 11 + i * 9, y0 + 9,
                           fill=COL_SUB, outline="")
 
-        if self.fraction is None:
+        if not self.points:
             c.create_text((x0 + x1) / 2, (y0 + y1 + 10) / 2,
-                          text="No point picked yet", fill=COL_SUB, font=(FONT, 9))
+                          text="No points picked yet", fill=COL_SUB, font=(FONT, 9))
             return
 
-        fx, fy = self.fraction
-        px = x0 + fx * rw
-        py = y0 + 10 + fy * (rh - 10)
-        c.create_line(px, y0 + 10, px, y1, fill=COL_ACCENT, dash=(2, 3))
-        c.create_line(x0, py, x1, py, fill=COL_ACCENT, dash=(2, 3))
-        c.create_oval(px - 5, py - 5, px + 5, py + 5,
-                      outline=COL_ACCENT, width=2)
-        c.create_oval(px - 1.5, py - 1.5, px + 1.5, py + 1.5,
-                      fill=COL_ACCENT, outline="")
-        label_y = py - 14 if py - 14 > y0 + 16 else py + 14
-        c.create_text(min(max(px, x0 + 46), x1 - 46), label_y,
-                      text=f"{fx * 100:.1f}% , {fy * 100:.1f}%",
-                      fill=COL_TEXT, font=(FONT, 8, "bold"))
+        coords = [(x0 + fx * rw, y0 + 10 + fy * (rh - 10))
+                  for fx, fy in self.points]
+
+        # connecting path in "in order" mode
+        if len(coords) > 1 and self.order_var.get() == "order":
+            path = coords + [coords[0]]
+            for (ax, ay), (bx, by) in zip(path, path[1:]):
+                c.create_line(ax, ay, bx, by, fill=COL_BORDER, dash=(3, 3))
+
+        single = len(coords) == 1
+        for i, (px, py) in enumerate(coords):
+            if single:
+                c.create_line(px, y0 + 10, px, y1, fill=COL_ACCENT, dash=(2, 3))
+                c.create_line(x0, py, x1, py, fill=COL_ACCENT, dash=(2, 3))
+            c.create_oval(px - 7, py - 7, px + 7, py + 7,
+                          outline=COL_ACCENT, width=2, fill=COL_CARD_HI)
+            if single:
+                c.create_oval(px - 2, py - 2, px + 2, py + 2,
+                              fill=COL_ACCENT, outline="")
+            else:
+                c.create_text(px, py, text=str(i + 1), fill=COL_TEXT,
+                              font=(FONT, 7, "bold"))
+
+        if single:
+            fx, fy = self.points[0]
+            px, py = coords[0]
+            label_y = py - 14 if py - 14 > y0 + 16 else py + 14
+            c.create_text(min(max(px, x0 + 46), x1 - 46), label_y,
+                          text=f"{fx * 100:.1f}% , {fy * 100:.1f}%",
+                          fill=COL_TEXT, font=(FONT, 8, "bold"))
+        else:
+            mode = "in order, looping" if self.order_var.get() == "order" else "random order"
+            c.create_text((x0 + x1) / 2, y1 - 8,
+                          text=f"{len(coords)} points — {mode}",
+                          fill=COL_SUB, font=(FONT, 8))
 
     # ---------------- Graphical point picking ----------------
 
@@ -972,10 +1059,15 @@ class AutoClickerApp:
         canvas = tk.Canvas(overlay, width=w, height=h, bg=COL_ACCENT,
                            highlightthickness=0, cursor="crosshair")
         canvas.pack(fill="both", expand=True)
-        canvas.create_text(
-            w // 2, max(24, h // 12),
-            text="Click the exact spot to auto-click   •   Esc to cancel",
-            fill="white", font=(FONT, 12, "bold"), tags="hint")
+        picked = []
+
+        def hint_text():
+            return (f"Click up to {MAX_POINTS} spots in the order to click them "
+                    f"({len(picked)}/{MAX_POINTS})   •   "
+                    "Right-click or Enter when done   •   Esc to cancel")
+
+        canvas.create_text(w // 2, max(24, h // 12), text=hint_text(),
+                           fill="white", font=(FONT, 12, "bold"), tags="hint")
 
         def on_motion(e):
             canvas.delete("cross")
@@ -987,12 +1079,33 @@ class AutoClickerApp:
                 fill="white", font=(FONT, 9, "bold"), tags="cross")
 
         def on_click(e):
+            if len(picked) >= MAX_POINTS:
+                return
             fx = min(max(e.x / max(w - 1, 1), 0.0), 1.0)
             fy = min(max(e.y / max(h - 1, 1), 0.0), 1.0)
-            self.fraction = (fx, fy)
+            picked.append((fx, fy))
+            n = len(picked)
+            canvas.create_oval(e.x - 11, e.y - 11, e.x + 11, e.y + 11,
+                               outline="white", width=2, tags="mark")
+            canvas.create_text(e.x, e.y, text=str(n), fill="white",
+                               font=(FONT, 10, "bold"), tags="mark")
+            canvas.delete("hint")
+            canvas.create_text(w // 2, max(24, h // 12), text=hint_text(),
+                               fill="white", font=(FONT, 12, "bold"), tags="hint")
+            if n >= MAX_POINTS:
+                overlay.after(250, on_done)
+
+        def on_done(_e=None):
+            if not picked:
+                on_cancel()
+                return
+            self.points = list(picked)
+            self.point_index = 0
             self._close_overlay()
             save_config(self._current_config())
-            self._flash_marker(sx + round(fx * (w - 1)), sy + round(fy * (h - 1)))
+            fx, fy = self.points[0]
+            self._flash_marker(sx + round(fx * (w - 1)), sy + round(fy * (h - 1)),
+                               number=1 if len(self.points) > 1 else None)
             self._finish_pick()
 
         def on_cancel(_e=None):
@@ -1001,6 +1114,8 @@ class AutoClickerApp:
 
         canvas.bind("<Motion>", on_motion)
         canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Button-3>", on_done)
+        overlay.bind("<Return>", on_done)
         overlay.bind("<Escape>", on_cancel)
         overlay.focus_force()
 
@@ -1014,10 +1129,15 @@ class AutoClickerApp:
         self.root.lift()
         self.root.focus_force()
         self._draw_preview()
-        self._hint("Cancelled." if cancelled
-                   else "Point saved. Use Test click to verify it.")
+        if cancelled:
+            self._hint("Cancelled.")
+        elif len(self.points) == 1:
+            self._hint("Point saved. Use Test click to verify it.")
+        else:
+            self._hint(f"{len(self.points)} points saved. "
+                       "Use Test click to verify them.")
 
-    def _flash_marker(self, sx, sy, rings=9):
+    def _flash_marker(self, sx, sy, rings=9, number=None):
         """Animated crosshair rings at a screen point, click-through by look."""
         size = 150
         half = size // 2
@@ -1041,8 +1161,12 @@ class AutoClickerApp:
             r = 8 + i * 7
             canvas.create_oval(half - r, half - r, half + r, half + r,
                                outline=COL_ACCENT, width=3)
-            canvas.create_oval(half - 4, half - 4, half + 4, half + 4,
-                               fill=COL_ACCENT, outline="")
+            if number is None:
+                canvas.create_oval(half - 4, half - 4, half + 4, half + 4,
+                                   fill=COL_ACCENT, outline="")
+            else:
+                canvas.create_text(half, half, text=str(number),
+                                   fill=COL_ACCENT, font=(FONT, 12, "bold"))
             canvas.create_line(half - r - 8, half, half + r + 8, half,
                                fill=COL_ACCENT, width=1)
             canvas.create_line(half, half - r - 8, half, half + r + 8,
@@ -1052,8 +1176,8 @@ class AutoClickerApp:
         frame()
 
     def _show_point(self):
-        if self.fraction is None:
-            messagebox.showwarning(APP_NAME, "Pick a click point first.")
+        if not self.points:
+            messagebox.showwarning(APP_NAME, "Pick the click points first.")
             return
         if self.target_hwnd is None or not user32.IsWindow(self.target_hwnd):
             messagebox.showwarning(APP_NAME, "The target window is gone — reselect it.")
@@ -1062,48 +1186,79 @@ class AutoClickerApp:
 
         def flash():
             geom = self._target_geometry()
-            if geom:
-                sx, sy, w, h = geom
-                fx, fy = self.fraction
-                self._flash_marker(sx + round(fx * (w - 1)), sy + round(fy * (h - 1)))
+            if not geom:
+                return
+            sx, sy, w, h = geom
+            many = len(self.points) > 1
+            for i, (fx, fy) in enumerate(self.points):
+                self.root.after(i * 350, lambda fx=fx, fy=fy, i=i: self._flash_marker(
+                    sx + round(fx * (w - 1)), sy + round(fy * (h - 1)),
+                    number=i + 1 if many else None))
 
         self.root.after(CAPTURE_SETTLE_MS, flash)
 
     # ---------------- Clicking ----------------
 
-    def _perform_click(self):
-        """Returns 'ok', 'blocked' or 'lost'."""
+    def _perform_click(self, fraction):
+        """Click one point. Returns 'ok', 'blocked' or 'lost'."""
         if self.target_hwnd is None or not user32.IsWindow(self.target_hwnd):
             if not self._reattach_window():
                 return "lost"
+        fx, fy = fraction
         if self.method_var.get() == "cursor":
             geom = self._target_geometry()   # refresh the size cache
             if geom is None:
                 return "lost"
-            ok = cursor_click_window(self.target_hwnd, *self.fraction)
+            ok = cursor_click_window(self.target_hwnd, fx, fy)
+            self._last_injection = time.monotonic()
             return "ok" if ok else "lost"
         # background mode: prefer live size, fall back to cache when minimized
         geom = self._target_geometry()
         size = (geom[2], geom[3]) if geom else self.cached_client_size
         if size is None:
             return "lost"
-        ok = post_click(self.target_hwnd, self.fraction[0], self.fraction[1], size)
+        ok = post_click(self.target_hwnd, fx, fy, size)
         return "ok" if ok else "blocked"
 
+    def _next_fraction(self):
+        """Pick which point to click next, honoring the order setting."""
+        if len(self.points) == 1:
+            return self.points[0]
+        if self.order_var.get() == "random":
+            return random.choice(self.points)
+        fraction = self.points[self.point_index % len(self.points)]
+        self.point_index = (self.point_index + 1) % len(self.points)
+        return fraction
+
     def _test_click(self):
-        if self.fraction is None:
-            messagebox.showwarning(APP_NAME, "Pick a click point first (step 2).")
+        if not self.points:
+            messagebox.showwarning(APP_NAME, "Pick the click points first (step 2).")
             return
         if self.target_hwnd is None:
             messagebox.showwarning(APP_NAME, "Select the target window first (step 1).")
             return
-        state = self._perform_click()
-        self._hint({"ok": "Test click sent ✓",
-                    "blocked": "Click was blocked — the target may need AutoClicker "
-                               "to run as administrator.",
-                    "lost": "Target window not found — reselect it in step 1."}[state])
-        if state == "ok" and self.method_var.get() == "background":
-            self.root.after(700, self._confirm_background_test)
+        if self._testing:
+            return
+        self._testing = True
+        self._test_step(0)
+
+    def _test_step(self, i):
+        if i >= len(self.points):
+            self._testing = False
+            if self.method_var.get() == "background":
+                self.root.after(300, self._confirm_background_test)
+            return
+        state = self._perform_click(self.points[i])
+        if state != "ok":
+            self._testing = False
+            self._hint({"blocked": "Click was blocked — the target may need "
+                                   "AutoClicker to run as administrator.",
+                        "lost": "Target window not found — reselect it in "
+                                "step 1."}[state])
+            return
+        label = f"point {i + 1}/{len(self.points)}" if len(self.points) > 1 else ""
+        self._hint(f"Test click sent {label} ✓")
+        self.root.after(500, self._test_step, i + 1)
 
     def _confirm_background_test(self):
         registered = messagebox.askyesno(
@@ -1123,23 +1278,33 @@ class AutoClickerApp:
 
     def _current_config(self):
         cfg = {"value": self.value_var.get(), "unit": self.unit_var.get(),
-               "method": self.method_var.get()}
+               "method": self.method_var.get(), "order": self.order_var.get(),
+               "polite": bool(self.polite_var.get())}
         if self.target_title:
             cfg["window_title"] = self.target_title
-        if self.fraction is not None:
-            cfg["fx"], cfg["fy"] = self.fraction
+        if self.points:
+            cfg["points"] = [[fx, fy] for fx, fy in self.points]
         return cfg
 
     def _restore_saved_config(self):
         cfg = load_config()
-        if "fx" in cfg and "fy" in cfg:
-            self.fraction = (float(cfg["fx"]), float(cfg["fy"]))
+        try:
+            self.points = [(float(fx), float(fy))
+                           for fx, fy in cfg.get("points", [])][:MAX_POINTS]
+        except (TypeError, ValueError):
+            self.points = []
+        if not self.points and "fx" in cfg and "fy" in cfg:   # pre-2.2 config
+            self.points = [(float(cfg["fx"]), float(cfg["fy"]))]
         if "value" in cfg:
             self.value_var.set(str(cfg["value"]))
         if cfg.get("unit") in UNIT_SECONDS:
             self.unit_var.set(cfg["unit"])
         if cfg.get("method") in ("background", "cursor"):
             self.method_var.set(cfg["method"])
+        if cfg.get("order") in ("order", "random"):
+            self.order_var.set(cfg["order"])
+        if isinstance(cfg.get("polite"), bool):
+            self.polite_var.set(cfg["polite"])
         title = cfg.get("window_title")
         if title and self.target_hwnd is None:
             self.target_title = title
@@ -1161,8 +1326,8 @@ class AutoClickerApp:
         if self.target_hwnd is None or not user32.IsWindow(self.target_hwnd):
             messagebox.showwarning(APP_NAME, "Select the target window first (step 1).")
             return
-        if self.fraction is None:
-            messagebox.showwarning(APP_NAME, "Pick the click point first (step 2).")
+        if not self.points:
+            messagebox.showwarning(APP_NAME, "Pick the click points first (step 2).")
             return
         interval = self._read_interval()
         if interval is None or interval < MIN_INTERVAL_SECONDS:
@@ -1174,9 +1339,11 @@ class AutoClickerApp:
         save_config(self._current_config())
 
         self.click_count = 0
+        self.point_index = 0
         self.paused = False
         self.remaining_when_paused = None
         self.last_click_state = "ok"
+        self.waiting_for_idle = False
         self.next_click_at = time.monotonic() + self.interval
 
         self.root.withdraw()
@@ -1262,14 +1429,38 @@ class AutoClickerApp:
             return
         now = time.monotonic()
         if not self.paused and now >= self.next_click_at:
-            self.last_click_state = self._perform_click()
-            if self.last_click_state == "ok":
-                self.click_count += 1
-            # schedule from "now" so a slow tick can't cause a burst of clicks
-            self.next_click_at = time.monotonic() + self.interval
+            if self._should_defer_for_idle(now):
+                self.waiting_for_idle = True
+            else:
+                self.waiting_for_idle = False
+                self.last_click_state = self._perform_click(self._next_fraction())
+                if self.last_click_state == "ok":
+                    self.click_count += 1
+                # schedule from "now" so a slow tick can't cause a click burst
+                self.next_click_at = time.monotonic() + self.interval
         self._update_status()
         self._keep_bar_on_screen()
         self._schedule_tick()
+
+    def _should_defer_for_idle(self, now):
+        """Polite mode: hold a due real-cursor click while the user is active.
+
+        Our own injected clicks also reset Windows' idle timer, so input
+        that coincides with our last injection doesn't count as the user
+        being active. A due click is never held longer than
+        MAX_POLITE_DEFER_SECONDS.
+        """
+        if (self.method_var.get() != "cursor" or not self.polite_var.get()
+                or self.interval < POLITE_MIN_INTERVAL):
+            return False
+        if now - self.next_click_at >= MAX_POLITE_DEFER_SECONDS:
+            return False
+        idle = user_idle_seconds()
+        if idle >= IDLE_THRESHOLD_SECONDS:
+            return False
+        injection_age = now - self._last_injection
+        input_was_ours = abs(injection_age - idle) < 0.5
+        return not input_was_ours
 
     def _update_status(self):
         self._pulse_on = not self._pulse_on
@@ -1286,11 +1477,23 @@ class AutoClickerApp:
             dot = COL_RED
             text = "Clicks blocked — try running as admin"
             fg = COL_RED
+        elif self.waiting_for_idle:
+            dot = COL_AMBER if self._pulse_on else "#7a5c14"
+            text = f"Waiting until you're idle…  •  {self.click_count} clicks"
+            fg = COL_AMBER
         else:
             dot = COL_GREEN if self._pulse_on else "#14532d"
             remaining = self.next_click_at - time.monotonic()
-            text = (f"Next in {format_duration(remaining)}"
-                    f"  •  {self.click_count} clicks")
+            if len(self.points) > 1:
+                if self.order_var.get() == "random":
+                    where = "random point"
+                else:
+                    where = f"point {self.point_index % len(self.points) + 1}/{len(self.points)}"
+                text = (f"Next in {format_duration(remaining)} ({where})"
+                        f"  •  {self.click_count} clicks")
+            else:
+                text = (f"Next in {format_duration(remaining)}"
+                        f"  •  {self.click_count} clicks")
             fg = COL_TEXT
         self.pulse.itemconfig(self.pulse_dot, fill=dot)
         self.status_label.config(text=text, fg=fg)
@@ -1309,9 +1512,11 @@ class AutoClickerApp:
 
     def _restart(self):
         self.click_count = 0
+        self.point_index = 0
         self.paused = False
         self.remaining_when_paused = None
         self.last_click_state = "ok"
+        self.waiting_for_idle = False
         self.next_click_at = time.monotonic() + self.interval
         self.pause_button.config(text="⏸ Pause")
         self._update_status()
