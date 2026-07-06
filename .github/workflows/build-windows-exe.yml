@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -23,9 +26,33 @@ jobs:
       - name: Build AutoClicker.exe
         run: pyinstaller --onefile --noconsole --name AutoClicker autoclicker.py
 
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          version=$(python -c "import re; print(re.search(r'APP_VERSION = \"(.+?)\"', open('autoclicker.py', encoding='utf-8').read()).group(1))")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: AutoClicker-windows-exe
           path: dist/AutoClicker.exe
           if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: AutoClicker v${{ steps.ver.outputs.version }}
+          files: dist/AutoClicker.exe
+          make_latest: true
+          body: |
+            **Download `AutoClicker.exe` below** — no installation needed, just run it.
+
+            Windows may show a SmartScreen warning the first time because the exe is unsigned:
+            choose *More info → Run anyway*.
+
+            See the [README](https://github.com/${{ github.repository }}#readme) for usage
+            instructions and the changelog.
